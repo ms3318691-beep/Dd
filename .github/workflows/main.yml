@@ -1,0 +1,94 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    # O limite máximo de runners padrão do GitHub Actions é 360 minutos (6 horas)
+    timeout-minutes: 360
+
+    steps:
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          # Habilita o Área de Trabalho Remota (RDP)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          # Configura a regra de firewall para a porta 3389
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          # Reinicia o serviço RDP para aplicar as alterações
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        shell: pwsh
+        run: |
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = [char[]](33,35,36,37,38,42,43,45,61,63,64,95) # Caracteres especiais seguros para CLI
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "Skyro" -Password $securePass -AccountNeverExpires -ErrorAction Stop
+          Add-LocalGroupMember -Group "Administrators" -Member "Skyro"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Skyro"
+
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          # Caso prefira continuar usando Auth Key tradicional, remova as duas linhas acima e descomente a linha abaixo:
+          # authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          tags: tag:ci
+          args: --hostname=gh-runner-${{ github.run_id }} --ephemeral
+
+      - name: Verify RDP & Get Tailscale IP
+        shell: pwsh
+        run: |
+          $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
+          if (-not $tsIP) {
+              Write-Error "Não foi possível obter o IP do Tailscale."
+              exit 1
+          }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          # Verifica se o serviço RDP está escutando localmente na porta 3389
+          $testResult = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "O serviço RDP não está respondendo na porta 3389."
+              exit 1
+          }
+          Write-Host "Serviço RDP ativo e validado com sucesso!"
+
+      - name: Maintain Connection
+        shell: pwsh
+        run: |
+          Write-Host "=========================================="
+          Write-Host "               ACESSO RDP                 "
+          Write-Host "=========================================="
+          Write-Host "Endereço : $env:TAILSCALE_IP"
+          Write-Host "Usuário  : Skyro"
+          Write-Host "Senha    : $env:RDP_PASSWORD"
+          Write-Host "=========================================="
+
+          while ($true) {
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Sessão RDP ativa. Cancele o workflow no GitHub para encerrar."
+              Start-Sleep -Seconds 300
+          }
+          
